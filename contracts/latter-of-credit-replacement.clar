@@ -6,12 +6,16 @@
 (define-constant ERR-INVALID-STATE (err u103))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u104))
 (define-constant ERR-EXPIRED (err u105))
+(define-constant ERR-DISPUTE-ACTIVE (err u106))
+(define-constant ERR-NO-DISPUTE (err u107))
+(define-constant ERR-DISPUTE-TIMEOUT (err u108))
 
 (define-constant STATE-CREATED u0)
 (define-constant STATE-FUNDED u1)
 (define-constant STATE-DELIVERED u2)
 (define-constant STATE-COMPLETED u3)
 (define-constant STATE-CANCELLED u4)
+(define-constant STATE-DISPUTED u5)
 
 (define-data-var lc-counter uint u0)
 
@@ -31,6 +35,17 @@
 (define-map lc-funds
   { lc-id: uint }
   { amount: uint }
+)
+
+(define-map disputes
+  { lc-id: uint }
+  {
+    raised-by: principal,
+    raised-at: uint,
+    reason: (string-ascii 256),
+    resolution-deadline: uint,
+    resolved: bool
+  }
 )
 
 (define-private (get-next-lc-id)
@@ -219,6 +234,102 @@
         (< (get state lc-data) STATE-COMPLETED)
         (not (is-lc-expired (get delivery-deadline lc-data)))
       )
+    false
+  )
+)
+
+(define-public (raise-dispute (lc-id uint) (reason (string-ascii 256)))
+  (let ((lc-data (unwrap! (map-get? letters-of-credit { lc-id: lc-id }) ERR-NOT-FOUND)))
+    (asserts! 
+      (or 
+        (is-eq (get state lc-data) STATE-FUNDED)
+        (is-eq (get state lc-data) STATE-DELIVERED)
+      )
+      ERR-INVALID-STATE
+    )
+    (asserts! (is-none (map-get? disputes { lc-id: lc-id })) ERR-DISPUTE-ACTIVE)
+    (asserts! 
+      (or 
+        (is-eq tx-sender (get buyer lc-data))
+        (is-eq tx-sender (get seller lc-data))
+      )
+      ERR-UNAUTHORIZED
+    )
+    
+    (map-set disputes
+      { lc-id: lc-id }
+      {
+        raised-by: tx-sender,
+        raised-at: stacks-block-height,
+        reason: reason,
+        resolution-deadline: (+ stacks-block-height u1440),
+        resolved: false
+      }
+    )
+    
+    (map-set letters-of-credit
+      { lc-id: lc-id }
+      (merge lc-data { state: STATE-DISPUTED })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (lc-id uint) (favor-buyer bool))
+  (let (
+    (lc-data (unwrap! (map-get? letters-of-credit { lc-id: lc-id }) ERR-NOT-FOUND))
+    (dispute-data (unwrap! (map-get? disputes { lc-id: lc-id }) ERR-NO-DISPUTE))
+    (fund-data (unwrap! (map-get? lc-funds { lc-id: lc-id }) ERR-NOT-FOUND))
+  )
+    (asserts! (is-eq (get state lc-data) STATE-DISPUTED) ERR-INVALID-STATE)
+    (asserts! (not (get resolved dispute-data)) ERR-INVALID-STATE)
+    
+    (asserts! 
+      (or 
+        (match (get delivery-confirmer lc-data)
+          confirmer (is-eq tx-sender confirmer)
+          false
+        )
+        (and 
+          (> stacks-block-height (get resolution-deadline dispute-data))
+          (or 
+            (is-eq tx-sender (get buyer lc-data))
+            (is-eq tx-sender (get seller lc-data))
+          )
+        )
+      )
+      ERR-UNAUTHORIZED
+    )
+    
+    (if favor-buyer
+      (try! (as-contract (stx-transfer? (get amount fund-data) tx-sender (get buyer lc-data))))
+      (try! (as-contract (stx-transfer? (get amount fund-data) tx-sender (get seller lc-data))))
+    )
+    
+    (map-set disputes
+      { lc-id: lc-id }
+      (merge dispute-data { resolved: true })
+    )
+    
+    (map-set letters-of-credit
+      { lc-id: lc-id }
+      (merge lc-data { state: STATE-COMPLETED })
+    )
+    
+    (map-delete lc-funds { lc-id: lc-id })
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-dispute (lc-id uint))
+  (map-get? disputes { lc-id: lc-id })
+)
+
+(define-read-only (is-dispute-expired (lc-id uint))
+  (match (map-get? disputes { lc-id: lc-id })
+    dispute-data (> stacks-block-height (get resolution-deadline dispute-data))
     false
   )
 )
