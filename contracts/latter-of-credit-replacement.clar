@@ -9,6 +9,9 @@
 (define-constant ERR-DISPUTE-ACTIVE (err u106))
 (define-constant ERR-NO-DISPUTE (err u107))
 (define-constant ERR-DISPUTE-TIMEOUT (err u108))
+(define-constant ERR-INVALID-MILESTONE (err u109))
+(define-constant ERR-MILESTONE-ALREADY-PAID (err u110))
+(define-constant ERR-INVALID-PERCENTAGE (err u111))
 
 (define-constant STATE-CREATED u0)
 (define-constant STATE-FUNDED u1)
@@ -46,6 +49,21 @@
     resolution-deadline: uint,
     resolved: bool
   }
+)
+
+(define-map milestones
+  { lc-id: uint, milestone-id: uint }
+  {
+    description: (string-ascii 256),
+    percentage: uint,
+    completed: bool,
+    paid: bool
+  }
+)
+
+(define-map milestone-counter
+  { lc-id: uint }
+  { count: uint }
 )
 
 (define-private (get-next-lc-id)
@@ -331,5 +349,110 @@
   (match (map-get? disputes { lc-id: lc-id })
     dispute-data (> stacks-block-height (get resolution-deadline dispute-data))
     false
+  )
+)
+
+(define-public (add-milestone (lc-id uint) (description (string-ascii 256)) (percentage uint))
+  (let (
+    (lc-data (unwrap! (map-get? letters-of-credit { lc-id: lc-id }) ERR-NOT-FOUND))
+    (counter-data (default-to { count: u0 } (map-get? milestone-counter { lc-id: lc-id })))
+    (milestone-id (get count counter-data))
+  )
+    (asserts! (is-eq tx-sender (get buyer lc-data)) ERR-UNAUTHORIZED)
+    (asserts! (is-eq (get state lc-data) STATE-CREATED) ERR-INVALID-STATE)
+    (asserts! (and (> percentage u0) (<= percentage u100)) ERR-INVALID-PERCENTAGE)
+    
+    (map-set milestones
+      { lc-id: lc-id, milestone-id: milestone-id }
+      {
+        description: description,
+        percentage: percentage,
+        completed: false,
+        paid: false
+      }
+    )
+    
+    (map-set milestone-counter
+      { lc-id: lc-id }
+      { count: (+ milestone-id u1) }
+    )
+    
+    (ok milestone-id)
+  )
+)
+
+(define-public (complete-milestone (lc-id uint) (milestone-id uint))
+  (let (
+    (lc-data (unwrap! (map-get? letters-of-credit { lc-id: lc-id }) ERR-NOT-FOUND))
+    (milestone-data (unwrap! (map-get? milestones { lc-id: lc-id, milestone-id: milestone-id }) ERR-INVALID-MILESTONE))
+  )
+    (asserts! (is-eq (get state lc-data) STATE-FUNDED) ERR-INVALID-STATE)
+    (asserts! (not (get completed milestone-data)) ERR-INVALID-STATE)
+    
+    (asserts! 
+      (or 
+        (is-eq tx-sender (get seller lc-data))
+        (is-eq tx-sender (get buyer lc-data))
+        (match (get delivery-confirmer lc-data)
+          confirmer (is-eq tx-sender confirmer)
+          false
+        )
+      )
+      ERR-UNAUTHORIZED
+    )
+    
+    (map-set milestones
+      { lc-id: lc-id, milestone-id: milestone-id }
+      (merge milestone-data { completed: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (release-milestone-payment (lc-id uint) (milestone-id uint))
+  (let (
+    (lc-data (unwrap! (map-get? letters-of-credit { lc-id: lc-id }) ERR-NOT-FOUND))
+    (milestone-data (unwrap! (map-get? milestones { lc-id: lc-id, milestone-id: milestone-id }) ERR-INVALID-MILESTONE))
+    (fund-data (unwrap! (map-get? lc-funds { lc-id: lc-id }) ERR-NOT-FOUND))
+    (payment-amount (/ (* (get amount lc-data) (get percentage milestone-data)) u100))
+  )
+    (asserts! (is-eq (get state lc-data) STATE-FUNDED) ERR-INVALID-STATE)
+    (asserts! (get completed milestone-data) ERR-INVALID-STATE)
+    (asserts! (not (get paid milestone-data)) ERR-MILESTONE-ALREADY-PAID)
+    (asserts! 
+      (or 
+        (is-eq tx-sender (get buyer lc-data))
+        (is-eq tx-sender (get seller lc-data))
+      )
+      ERR-UNAUTHORIZED
+    )
+    
+    (try! (as-contract (stx-transfer? payment-amount tx-sender (get seller lc-data))))
+    
+    (map-set milestones
+      { lc-id: lc-id, milestone-id: milestone-id }
+      (merge milestone-data { paid: true })
+    )
+    
+    (let ((remaining-funds (- (get amount fund-data) payment-amount)))
+      (if (> remaining-funds u0)
+        (map-set lc-funds { lc-id: lc-id } { amount: remaining-funds })
+        (map-delete lc-funds { lc-id: lc-id })
+      )
+    )
+    
+    (ok payment-amount)
+  )
+)
+
+(define-read-only (get-milestone (lc-id uint) (milestone-id uint))
+  (map-get? milestones { lc-id: lc-id, milestone-id: milestone-id })
+)
+
+(define-read-only (get-milestone-count (lc-id uint))
+  (match (map-get? milestone-counter { lc-id: lc-id })
+    counter-data (some (get count counter-data))
+    (some u0)
   )
 )
