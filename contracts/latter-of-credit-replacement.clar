@@ -456,3 +456,37 @@
     (some u0)
   )
 )
+
+(define-read-only (get-lc-overview (lc-id uint))
+  (match (map-get? letters-of-credit { lc-id: lc-id })
+    lc-data
+      (let (
+        (funds (default-to { amount: u0 } (map-get? lc-funds { lc-id: lc-id })))
+        (dispute-opt (map-get? disputes { lc-id: lc-id }))
+        (counter-opt (map-get? milestone-counter { lc-id: lc-id }))
+        (milestone-count (match counter-opt counter-data (get count counter-data) u0))
+        (has-dispute (is-some dispute-opt))
+        (dispute-active (match dispute-opt dispute-data (not (get resolved dispute-data)) false))
+        (dispute-deadline (match dispute-opt dispute-data (some (get resolution-deadline dispute-data)) none))
+      )
+        (ok
+          {
+            lc-id: lc-id,
+            buyer: (get buyer lc-data),
+            seller: (get seller lc-data),
+            amount: (get amount lc-data),
+            locked-amount: (get amount funds),
+            state: (get state lc-data),
+            is-active: (is-lc-active lc-id),
+            has-dispute: has-dispute,
+            dispute-active: dispute-active,
+            dispute-deadline: dispute-deadline,
+            milestone-count: milestone-count,
+            created-at: (get created-at lc-data),
+            delivery-deadline: (get delivery-deadline lc-data)
+          }
+        )
+      )
+    ERR-NOT-FOUND
+  )
+)
